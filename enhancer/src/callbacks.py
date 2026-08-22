@@ -99,7 +99,7 @@ def post_event(config: RuntimeConfig, payload: dict[str, Any], timeout: float = 
 
 def _should_try_fallback(error: Exception) -> bool:
     text = str(error)
-    return text.startswith("HTTP 401 ") or text.startswith("HTTP 403 ") or text.startswith("HTTP 200 NON_JSON ")
+    return text.startswith("HTTP 401 ") or text.startswith("HTTP 403 ")
 
 
 def _post_event_once(
@@ -126,9 +126,13 @@ def _post_event_once(
                 return None
             try:
                 return json.loads(raw)
-            except json.JSONDecodeError as error:
-                text = raw.decode("utf-8", "replace")[:1000]
-                raise RuntimeError(f"HTTP 200 NON_JSON from {target_url}: {text}") from error
+            except json.JSONDecodeError:
+                # Match H3's best-effort callback contract: a successful HTTP
+                # response is accepted even when an upstream layer returns a
+                # non-JSON body. D1 state remains recoverable through the direct
+                # pod polling loop, so callback response parsing must not make a
+                # healthy GPU job look failed/noisy.
+                return None
     except urllib.error.HTTPError as error:
         response_body = error.read().decode("utf-8", "replace")[:1000]
         raise RuntimeError(f"HTTP {error.code} {error.reason} from {target_url}: {response_body}") from error

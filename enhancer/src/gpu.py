@@ -16,8 +16,23 @@ EXPECTED_TRT_PYTHON_VERSIONS = {EXPECTED_TRT, f"{EXPECTED_TRT}.post1"}
 
 
 def _cmd(args: list[str], timeout: int = 20) -> str:
-    result = subprocess.run(args, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
-    return result.stdout.strip()
+    try:
+        result = subprocess.run(
+            args,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as error:
+        output = str(error.stdout or "").strip()
+        command = " ".join(str(arg) for arg in args)
+        detail = output[-4000:] if output else "no process output"
+        raise RuntimeError(
+            f"COMMAND_FAILED:{error.returncode}:{command}: {detail}"
+        ) from error
 
 
 def _nvidia_query() -> dict[str, Any]:
@@ -57,9 +72,14 @@ def _nvenc_smoke() -> None:
         raise RuntimeError("NVENC_HEVC_ENCODER_MISSING")
     with tempfile.TemporaryDirectory(prefix="sb-nvenc-") as tmp:
         output = Path(tmp) / "smoke.mp4"
+        # Do not use a 128px-wide HEVC qualification frame. NVENC on newer
+        # generations rejects that tiny HEVC width before the real Enhancer job
+        # ever starts. Exercise the same HEVC Main10/p010 path as production with
+        # a small but valid 256x256 frame instead.
         _cmd([
-            "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=128x128:r=1",
-            "-frames:v", "1", "-c:v", "hevc_nvenc", "-pix_fmt", "p010le", "-y", str(output),
+            "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=256x256:r=1",
+            "-frames:v", "1", "-c:v", "hevc_nvenc", "-profile:v", "main10",
+            "-pix_fmt", "p010le", "-y", str(output),
         ], timeout=30)
         if not output.is_file() or output.stat().st_size <= 0:
             raise RuntimeError("NVENC_SMOKE_EMPTY")

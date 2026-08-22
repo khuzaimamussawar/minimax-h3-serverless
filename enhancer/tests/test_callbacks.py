@@ -1,4 +1,5 @@
 import importlib
+from unittest.mock import patch
 
 from enhancer.src import callbacks
 from enhancer.src.callbacks import EVENT_PATH, H3_EVENT_PATH, event_url
@@ -79,3 +80,24 @@ def test_boot_worker_idle_is_suppressed_until_real_job_activity():
     assert real_idle is not None
     assert real_idle["idleSince"] == 1_700_000_000
     assert real_idle["terminateAfter"] == 1_700_000_060
+
+
+def test_successful_non_json_callback_response_is_best_effort_like_h3():
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b"<html><title>Sign in</title></html>"
+
+    module = importlib.reload(callbacks)
+    with patch.object(module.urllib.request, "urlopen", return_value=FakeResponse()):
+        assert module._post_event_once(
+            _config(),
+            "https://scene-builder.example.com/api/projects/v2/h3/pod/events",
+            b"{}",
+            1.0,
+        ) is None

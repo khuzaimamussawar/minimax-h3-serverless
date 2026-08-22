@@ -11,6 +11,7 @@ import numpy as np
 
 from .engine_runtime import try_interpolate_rife_trt
 from .models import interpolate_rife
+from .video_encoder import normalize_video_encoder, video_encoder_args, video_encoder_failure_code
 
 Progress = Callable[[str, float, dict[str, Any] | None], None]
 
@@ -22,11 +23,10 @@ def _hard_cut(a: np.ndarray, b: np.ndarray) -> bool:
     return mad >= 0.32
 
 
-def _encoder(path: Path, width: int, height: int, fps: float, cq: int) -> subprocess.Popen:
+def _encoder(path: Path, width: int, height: int, fps: float, settings: dict[str, Any]) -> subprocess.Popen:
     return subprocess.Popen([
         "ffmpeg", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}",
-        "-r", f"{fps:.8f}", "-i", "pipe:0", "-an", "-c:v", "hevc_nvenc", "-profile:v", "main10",
-        "-pix_fmt", "p010le", "-preset", "p6", "-rc", "vbr", "-cq", str(cq), "-tag:v", "hvc1",
+        "-r", f"{fps:.8f}", "-i", "pipe:0", "-an", *video_encoder_args(settings),
         "-movflags", "+faststart", "-y", str(path)
     ], stdin=subprocess.PIPE)
 
@@ -51,6 +51,10 @@ def interpolate_file(
     if model == "gimm-vfi-f": raise RuntimeError("GIMM_LICENSE_NOT_CLEARED")
     if model not in {"rife", "rife-4.9", "none"}: raise ValueError(f"Unsupported VFI model: {model}")
 
+    encoder_settings = dict(settings or {})
+    encoder_settings.setdefault("nvencCq", cq)
+    video_encoder = normalize_video_encoder(encoder_settings)
+
     inp = av.open(str(source)); stream = inp.streams.video[0]
     nominal_fps = float(stream.average_rate or 24.0)
     frames = iter(inp.decode(stream))
@@ -58,7 +62,7 @@ def interpolate_file(
     except StopIteration: raise RuntimeError("FFMPEG_DECODE_FAILED:no frames")
     first_arr = first.to_ndarray(format="bgr24")
     height, width = first_arr.shape[:2]
-    enc = _encoder(output, width, height, float(target_fps), cq); assert enc.stdin is not None
+    enc = _encoder(output, width, height, float(target_fps), encoder_settings); assert enc.stdin is not None
     effective_speed = playback_speed if timing_baked else 1.0
     neural = model != "none" and target_fps > nominal_fps * effective_speed + 1e-6
     prev = first_arr
@@ -100,12 +104,12 @@ def interpolate_file(
                 out = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             emit(out); next_out += 1.0 / target_fps
         decoded += 1; prev = current; prev_t = current_t
-        if progress: progress("interpolating" if neural else "resampling", min(92.0, 40 + decoded / max(2, decoded + 8) * 50), {"decoded": decoded, "emitted": emitted})
+        if progress: progress("interpolating" if neural else "resampling", min(92.0, 40 + decoded / max(2, decoded + 8) * 50), {"decoded": decoded, "emitted": emitted, "videoEncoder": video_encoder})
 
     source_end = prev_t + max(last_interval, 1.0 / nominal_fps)
     output_end = source_end / effective_speed
     while next_out < output_end - 1e-9:
         emit(prev); next_out += 1.0 / target_fps
     inp.close(); enc.stdin.close()
-    if enc.wait(timeout=600) != 0: raise RuntimeError("NVENC_ENCODE_FAILED")
-    return {"frames": emitted, "targetFps": target_fps, "timingBaked": timing_baked, "sourceSpeed": playback_speed, "neuralVfi": neural}
+    if enc.wait(timeout=600) != 0: raise RuntimeError(video_encoder_failure_code(encoder_settings))
+    return {"frames": emitted, "targetFps": target_fps, "timingBaked": timing_baked, "sourceSpeed": playback_speed, "neuralVfi": neural, "videoEncoder": video_encoder}

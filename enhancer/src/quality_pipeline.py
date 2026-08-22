@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 from .r2_store import upload_file
 from .vfi_postprocess import interpolate_file
+from .video_encoder import normalize_video_encoder, video_encoder_args, video_encoder_failure_code
 
 FLASH_ROOT = Path(os.environ.get("FLASHVSR_ROOT", "/opt/FlashVSR"))
 SCRIPT = FLASH_ROOT / "examples/WanVSR/infer_flashvsr_v1.1_tiny_long_video.py"
@@ -63,16 +64,19 @@ def _atempo(speed: float) -> str:
     return ",".join(f"atempo={value:.8f}" for value in stages)
 
 
-def _finish_video(video: Path, source: Path, output: Path, width: int, height: int, *, speed: float, timing_baked: bool, has_audio: bool, cq: int) -> None:
+def _finish_video(video: Path, source: Path, output: Path, width: int, height: int, *, speed: float, timing_baked: bool, has_audio: bool, settings: dict[str, Any]) -> None:
     args = ["ffmpeg", "-v", "error", "-i", str(video)]
     if has_audio: args += ["-i", str(source)]
     args += ["-map", "0:v:0"]
     if has_audio: args += ["-map", "1:a:0?"]
-    args += ["-vf", f"scale={width}:{height}:flags=lanczos", "-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le", "-preset", "p6", "-rc", "vbr", "-cq", str(cq), "-tag:v", "hvc1"]
+    args += ["-vf", f"scale={width}:{height}:flags=lanczos", *video_encoder_args(settings)]
     if has_audio and timing_baked and not math.isclose(speed, 1.0): args += ["-filter:a", _atempo(speed), "-c:a", "aac", "-b:a", "192k"]
     elif has_audio: args += ["-c:a", "copy"]
     args += ["-shortest", "-movflags", "+faststart", "-y", str(output)]
-    subprocess.run(args, check=True, timeout=1200)
+    completed = subprocess.run(args, capture_output=True, text=True, timeout=1200, check=False)
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "no ffmpeg output")[-4000:]
+        raise RuntimeError(f"{video_encoder_failure_code(settings)}:{detail}")
 
 
 def run_video_upscale(job: dict[str, Any], cancel_event, progress: Progress) -> dict[str, Any]:
@@ -84,6 +88,7 @@ def run_video_upscale(job: dict[str, Any], cancel_event, progress: Progress) -> 
     interpolation = str(settings.get("interpolationModel") or "none").lower()
     if interpolation == "gimm-vfi-f": raise RuntimeError("GIMM_LICENSE_NOT_CLEARED")
     if interpolation not in {"none", "rife", "rife-4.9"}: raise ValueError(f"Unsupported local VFI: {interpolation}")
+    video_encoder = normalize_video_encoder(settings)
 
     import torch
     if not torch.cuda.is_available(): raise RuntimeError("CUDA_UNAVAILABLE")
@@ -97,7 +102,7 @@ def run_video_upscale(job: dict[str, Any], cancel_event, progress: Progress) -> 
         if not target: raise ValueError("Unsupported target resolution")
         target_w, target_h = target[::-1] if source_probe["height"] > source_probe["width"] else target
         scale = min(4.0, max(1.0, max(target_w / source_probe["width"], target_h / source_probe["height"])))
-        progress("preparing_model", 10, {"precision": "bf16", "scale": scale})
+        progress("preparing_model", 10, {"precision": "bf16", "scale": scale, "videoEncoder": video_encoder})
         pipe = _pipe(); mod = _module()
         if cancel_event.is_set(): raise RuntimeError("CANCELLED")
         lq, th, tw, frame_count, fps = mod.prepare_input_tensor(str(source), scale=scale, dtype=torch.bfloat16, device="cuda")
@@ -117,17 +122,17 @@ def run_video_upscale(job: dict[str, Any], cancel_event, progress: Progress) -> 
         speed = float(settings.get("directorSpeed") or 1.0); timing_baked = bool(settings.get("smoothSlowMotion") or settings.get("timingBaked"))
         target_fps = int(settings.get("targetFps") or 0)
         base_for_finish = flash_raw
-        vfi_meta: dict[str, Any] = {"neuralVfi": False}
+        vfi_meta: dict[str, Any] = {"neuralVfi": False, "videoEncoder": video_encoder}
         if target_fps:
-            progress("interpolating", 72, {"model": interpolation, "targetFps": target_fps})
+            progress("interpolating", 72, {"model": interpolation, "targetFps": target_fps, "videoEncoder": video_encoder})
             vfi_meta = interpolate_file(flash_raw, temporal, target_fps=target_fps, playback_speed=speed,
                                         timing_baked=timing_baked, interpolation_model=interpolation,
                                         cq=int(settings.get("nvencCq") or 17), cancel_event=cancel_event, progress=progress,
                                         settings=settings)
             base_for_finish = temporal
-        progress("encoding", 91, None)
+        progress("encoding", 91, {"videoEncoder": video_encoder})
         _finish_video(base_for_finish, source, final, target_w, target_h, speed=speed,
-                      timing_baked=timing_baked and not target_fps, has_audio=source_probe["hasAudio"], cq=int(settings.get("nvencCq") or 17))
+                      timing_baked=timing_baked and not target_fps, has_audio=source_probe["hasAudio"], settings=settings)
         # interpolate_file changes video timing but intentionally emits video-only;
         # mux/stretches audio here when VFI ran.
         if target_fps and source_probe["hasAudio"]:
@@ -140,6 +145,6 @@ def run_video_upscale(job: dict[str, Any], cancel_event, progress: Progress) -> 
         progress("uploading", 96, None); stored = upload_file(final, output_key, "video/mp4")
         final_probe = _probe(final); progress("completed", 100, None)
         return {**stored, "runtime": "scenebuilder-enhancer-quality", "modelFamily": "flashvsr-v1.1", "precision": "bf16",
-                "interpolationModel": "rife-4.9" if vfi_meta.get("neuralVfi") else "none", "targetFps": target_fps or fps,
-                "timingBaked": timing_baked, "sourceSpeed": speed, "durationMs": round(final_probe["duration"] * 1000),
-                "width": target_w, "height": target_h}
+                "interpolationModel": "rife-4.9" if vfi_meta.get("neuralVfi") else "none", "videoEncoder": video_encoder,
+                "targetFps": target_fps or fps, "timingBaked": timing_baked, "sourceSpeed": speed,
+                "durationMs": round(final_probe["duration"] * 1000), "width": target_w, "height": target_h}

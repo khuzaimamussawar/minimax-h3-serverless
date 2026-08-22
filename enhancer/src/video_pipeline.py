@@ -17,6 +17,7 @@ import numpy as np
 from .models import interpolate_rife, upscale_bgr
 from .r2_store import upload_file
 from .engine_runtime import try_interpolate_rife_trt, try_upscale_bgr_trt
+from .video_encoder import normalize_video_encoder, video_encoder_args, video_encoder_failure_code
 
 Progress = Callable[[str, float, dict[str, Any] | None], None]
 
@@ -119,14 +120,14 @@ def _spatial(frame_bgr: np.ndarray, model_name: str, target_w: int, target_h: in
     return enhanced
 
 
-def _open_encoder(output: Path, width: int, height: int, fps: float, cq: int) -> subprocess.Popen:
-    return subprocess.Popen([
+def _open_encoder(output: Path, width: int, height: int, fps: float, settings: dict[str, Any]) -> subprocess.Popen:
+    args = [
         "ffmpeg", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
-        "-s", f"{width}x{height}", "-r", f"{fps:.8f}", "-i", "pipe:0",
-        "-an", "-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le",
-        "-preset", "p6", "-rc", "vbr", "-cq", str(cq), "-tag:v", "hvc1",
+        "-s", f"{width}x{height}", "-r", f"{fps:.8f}", "-i", "pipe:0", "-an",
+        *video_encoder_args(settings),
         "-movflags", "+faststart", "-y", str(output),
-    ], stdin=subprocess.PIPE)
+    ]
+    return subprocess.Popen(args, stdin=subprocess.PIPE)
 
 
 def _mux_audio(video_only: Path, source: Path, output: Path, *, speed: float, timing_baked: bool, has_audio: bool) -> None:
@@ -176,6 +177,7 @@ def run_fast_video(job: dict[str, Any], cancel_event, progress: Progress) -> dic
         raise RuntimeError("GIMM_LICENSE_NOT_CLEARED")
     if interpolation not in {"none", "rife-4.9", "rife"}:
         raise ValueError(f"unsupported local interpolation model: {interpolation}")
+    video_encoder = normalize_video_encoder(settings)
 
     with tempfile.TemporaryDirectory(prefix="sb-enhancer-video-") as tmp:
         root = Path(tmp); source = root / "input.mp4"; video_only = root / "video.mp4"; final = root / "final.mp4"
@@ -183,7 +185,7 @@ def run_fast_video(job: dict[str, Any], cancel_event, progress: Progress) -> dic
         probe = _probe(source)
         out_w, out_h = _target_dimensions(str(settings.get("targetResolution") or "1080p"), probe.width, probe.height)
         fps_out = float(target_fps or probe.fps or 24.0)
-        encoder = _open_encoder(video_only, out_w, out_h, fps_out, int(settings.get("nvencCq") or 17))
+        encoder = _open_encoder(video_only, out_w, out_h, fps_out, settings)
         assert encoder.stdin is not None
 
         container = av.open(str(source)); stream = container.streams.video[0]
@@ -248,7 +250,7 @@ def run_fast_video(job: dict[str, Any], cancel_event, progress: Progress) -> dic
             decoded += 1
             prev_raw, prev_pts, prev_sr = cur_raw, cur_pts, cur_sr
             percent = min(82.0, 8.0 + 74.0 * (cur_pts / max(probe.duration, cur_pts, 0.001)))
-            progress("interpolating" if neural_vfi else "upscaling", percent, {"decoded": decoded, "emitted": emitted})
+            progress("interpolating" if neural_vfi else "upscaling", percent, {"decoded": decoded, "emitted": emitted, "videoEncoder": video_encoder})
 
         # Emit tail through the authoritative selected duration.
         source_duration = probe.duration if probe.duration > 0 else prev_pts + 1.0 / nominal_source_fps
@@ -257,8 +259,8 @@ def run_fast_video(job: dict[str, Any], cancel_event, progress: Progress) -> dic
             emit(prev_sr); next_output_t += 1.0 / fps_out
         container.close(); encoder.stdin.close()
         if encoder.wait(timeout=600) != 0:
-            raise RuntimeError("NVENC_ENCODE_FAILED")
-        progress("encoding", 88, {"frames": emitted, "targetFps": fps_out})
+            raise RuntimeError(video_encoder_failure_code(settings))
+        progress("encoding", 88, {"frames": emitted, "targetFps": fps_out, "videoEncoder": video_encoder})
         _mux_audio(video_only, source, final, speed=speed, timing_baked=timing_baked, has_audio=probe.has_audio)
         progress("uploading", 94, None)
         stored = upload_file(final, output_key, "video/mp4")
@@ -269,6 +271,7 @@ def run_fast_video(job: dict[str, Any], cancel_event, progress: Progress) -> dic
             "runtime": "scenebuilder-enhancer-fast",
             "modelFamily": model_name,
             "interpolationModel": "rife-4.9" if neural_vfi else "none",
+            "videoEncoder": video_encoder,
             "targetFps": fps_out,
             "timingBaked": timing_baked,
             "sourceSpeed": speed,

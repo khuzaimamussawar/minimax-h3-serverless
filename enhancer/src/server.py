@@ -17,6 +17,7 @@ from .engine_builder import run_engine_build
 from .fast_pipeline import run_fast_video, run_image_upscale, run_image_upscale_batch
 from .gpu import qualify_gpu, telemetry
 from .quality_pipeline import run_video_upscale as run_quality_video
+from .video_encoder import normalize_video_encoder
 
 app = FastAPI(title="SceneBuilder Enhancer Pod", version="2.0")
 
@@ -58,7 +59,6 @@ class JobRecord:
     last_callback_at: float = 0.0
 
     def public(self) -> dict[str, Any]:
-        # Never serialize threading.Event or arbitrary internal objects.
         return {
             "id": self.id,
             "status": self.status,
@@ -100,7 +100,6 @@ def _progress(record: JobRecord, stage: str, value: float, detail: dict[str, Any
         record.stage = str(stage)
         record.progress = max(0.0, min(100.0, float(value)))
         record.updated_at = int(now * 1000)
-    # Throttle provider callbacks while keeping local GET /jobs precise.
     if now - record.last_callback_at >= 1.0 or value >= 100:
         record.last_callback_at = now
         _event("job_progress", jobId=record.id, status=record.status, stage=record.stage,
@@ -114,7 +113,8 @@ def _error_code(error: BaseException) -> str:
         "GPU_CAPABILITY_MISMATCH", "GPU_VRAM_BELOW_POLICY", "TRT_ENGINE_NOT_FOUND",
         "TRT_DESERIALIZE_FAILED", "TRT_BUILD_FAILED", "MODEL_LOAD_FAILED", "RIFE_RUNTIME_FAILED",
         "GIMM_LICENSE_NOT_CLEARED", "FLASHVSR_SELF_TEST_FAILED", "FFMPEG_DECODE_FAILED",
-        "NVENC_ENCODE_FAILED", "R2_INPUT_FAILED", "R2_OUTPUT_FAILED", "CANCELLED",
+        "NVENC_HEVC_ENCODER_MISSING", "NVENC_ENCODE_FAILED", "X265_ENCODER_MISSING", "X265_ENCODE_FAILED",
+        "R2_INPUT_FAILED", "R2_OUTPUT_FAILED", "CANCELLED",
     ]
     for code in known:
         if code in text:
@@ -142,6 +142,12 @@ def _run_job(record: JobRecord) -> None:
                 raise RuntimeError("MODEL_LOAD_FAILED:image_upscale_batch requires FAST runtime")
             result = run_image_upscale_batch(record.payload, record.cancel_event, progress)
         elif job_type == "video_upscale":
+            settings = record.payload.get("settings") or {}
+            if normalize_video_encoder(settings) == "nvenc":
+                # Encoder choice comes from the job/Admin UI. Only NVENC jobs
+                # pay the real hardware smoke check; x265 jobs must not be
+                # rejected merely because a GPU has no working NVENC block.
+                qualify_gpu(require_nvenc=True)
             result = run_quality_video(record.payload, record.cancel_event, progress) if config().service_kind == "enhancer_quality" else run_fast_video(record.payload, record.cancel_event, progress)
         elif job_type == "engine_build":
             if config().service_kind != "enhancer_engine_builder":
@@ -187,9 +193,7 @@ def _require_auth(authorization: str | None) -> None:
 def _boot() -> None:
     global _READY, _QUALIFICATION, _STARTUP_ERROR, _IDLE_SINCE
     try:
-        builder = config().service_kind == "enhancer_engine_builder"
-        _QUALIFICATION = qualify_gpu(require_nvenc=not builder)
-        # Service-specific imports/models are deliberately not CPU-fallbacked.
+        _QUALIFICATION = qualify_gpu(require_nvenc=False)
         if config().service_kind == "enhancer_fast":
             from .models import esrgan
             esrgan("RealESRGAN_x4plus_anime_6B")
@@ -205,10 +209,7 @@ def _boot() -> None:
             if trt.Builder(trt.Logger(trt.Logger.WARNING)) is None:
                 raise RuntimeError("TRT_BUILD_FAILED:TensorRT builder unavailable")
         _READY = True
-        _IDLE_SINCE = time.time()
-        # Match H3: boot emits worker_ready once. The control plane immediately
-        # dispatches the assigned/waiting job; worker_idle is only a post-job
-        # lifecycle event.
+        _IDLE_SINCE = None
         _event("worker_ready", readyAt=time.time(), qualification=_QUALIFICATION, capabilities=_capabilities())
     except Exception as error:
         _STARTUP_ERROR = str(error)
@@ -248,6 +249,10 @@ def _capabilities() -> dict[str, Any]:
         "gimmPackaged": True,
         "gimmProductionEnabled": False,
         "targetFps": [30, 48, 60],
+        "videoEncoders": {
+            "nvenc": {"codec": "hevc_nvenc", "qualityControl": "cq", "min": 12, "max": 25},
+            "x265": {"codec": "libx265", "qualityControl": "crf", "min": 12, "max": 25},
+        },
         "precision": {"esrgan": "fp16", "rife": "fp16", "gimm": "fp32", "flashvsr": "bf16"},
         "cuda": "13.0.2", "pytorch": "2.13.0-cu130", "tensorrt": "10.14.1.48",
     }
@@ -255,7 +260,7 @@ def _capabilities() -> dict[str, Any]:
 
 @app.on_event("startup")
 def on_startup() -> None:
-    config()  # fail fast on missing shared H3 runtime env names
+    config()
     threading.Thread(target=_boot, daemon=True, name="enhancer-boot").start()
     threading.Thread(target=_idle_monitor, daemon=True, name="enhancer-idle-monitor").start()
 
